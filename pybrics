@@ -1,0 +1,241 @@
+# ============================================================
+# FLL PYBRICKS PRO BASE (SPIKE Prime)
+# Ports: Left=E  Right=A
+# Wheels: SPIKE large (~56mm) | Default axle_track 112mm
+# Features:
+# - Gyro heading hold PID for straight driving
+# - Gyro PID turns (turn-in-place)
+# - Speed ramping near target (smooth stops)
+# - Utility helpers: reset, settle, clamp, beep
+# - Run structure: run1(), run2() ... (add your missions)
+# ============================================================
+
+from pybricks.hubs import PrimeHub
+from pybricks.pupdevices import Motor
+from pybricks.robotics import DriveBase
+from pybricks.parameters import Port, Direction, Stop
+from pybricks.tools import StopWatch, wait
+
+# ---------------- HUB / MOTORS ----------------
+hub = PrimeHub()
+
+LEFT_PORT  = Port.E
+RIGHT_PORT = Port.A
+
+left_motor  = Motor(LEFT_PORT,  Direction.COUNTERCLOCKWISE)
+right_motor = Motor(RIGHT_PORT, Direction.CLOCKWISE)
+
+# ---------------- GEOMETRY (defaults) ----------------
+WHEEL_DIAMETER = 56   # mm
+AXLE_TRACK     = 112  # mm (default starting point)
+
+drive = DriveBase(left_motor, right_motor, WHEEL_DIAMETER, AXLE_TRACK)
+
+# ---------------- DRIVE SETTINGS ----------------
+drive.settings(
+    straight_speed=300,          # mm/s
+    straight_acceleration=800,   # mm/s^2
+    turn_rate=240,               # deg/s
+    turn_acceleration=800        # deg/s^2
+)
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def beep(n=1, ms=60):
+    for _ in range(n):
+        hub.speaker.beep(880, ms)
+        wait(ms)
+
+def settle(ms=120):
+    """Small pause to let robot stop drifting after brake."""
+    drive.stop()
+    wait(ms)
+
+def reset_pose(heading=0):
+    """Resets encoders + drive distance and sets gyro heading."""
+    drive.stop()
+    drive.reset()
+    hub.imu.reset_heading(heading)
+    wait(150)
+
+def stop_brake():
+    drive.stop()
+    left_motor.stop()
+    right_motor.stop()
+
+# ============================================================
+# GYRO PID STRAIGHT (Heading Hold)
+# ============================================================
+
+def gyro_straight(distance_mm, base_speed=260, heading_deg=0,
+                  kp=3.0, ki=0.00, kd=16.0,
+                  i_limit=200, turn_limit=160,
+                  ramp_zone_ratio=0.20, min_speed_ratio=0.25):
+    """
+    Drive straight by distance, holding absolute gyro heading.
+    Uses drive.drive(speed, turn_rate) with PID over hub.imu.heading().
+    """
+
+    reset_pose(heading=heading_deg)
+
+    target = distance_mm
+    sign = 1 if target >= 0 else -1
+    base_speed = abs(base_speed) * sign
+
+    # ramp-down zone near the end (smooth stopping)
+    ramp_zone = max(80, abs(target) * ramp_zone_ratio)
+
+    integral = 0.0
+    last_error = 0.0
+
+    sw = StopWatch()
+    last_t = sw.time()
+
+    while True:
+        dist = drive.distance()
+        remaining = target - dist
+
+        if abs(remaining) <= 2:  # tolerance mm
+            break
+
+        # timing
+        now = sw.time()
+        dt = (now - last_t) / 1000.0
+        if dt <= 0:
+            dt = 0.01
+        last_t = now
+
+        # error
+        heading = hub.imu.heading()
+        error = heading_deg - heading
+
+        # integral (optional)
+        integral += error * dt
+        integral = clamp(integral, -i_limit, i_limit)
+
+        # derivative
+        derivative = (error - last_error) / dt
+        last_error = error
+
+        # turn command
+        turn_rate = kp * error + ki * integral + kd * derivative
+        turn_rate = clamp(turn_rate, -turn_limit, turn_limit)
+
+        # speed ramp near end
+        spd = base_speed
+        if abs(remaining) < ramp_zone:
+            f = abs(remaining) / ramp_zone  # 0..1
+            spd = base_speed * (min_speed_ratio + (1 - min_speed_ratio) * f)
+
+        drive.drive(spd, turn_rate)
+        wait(10)
+
+    stop_brake()
+    settle(120)
+
+# ============================================================
+# GYRO PID TURN (Turn-in-place to relative angle)
+# ============================================================
+
+def gyro_turn(relative_deg,
+              kp=4.0, ki=0.00, kd=28.0,
+              i_limit=120, turn_limit=240,
+              tol=1.5, timeout_ms=2500):
+    """
+    Turn in place by relative_deg degrees using gyro heading PID.
+    """
+    reset_pose(heading=0)
+
+    target = relative_deg
+    integral = 0.0
+    last_error = 0.0
+
+    sw = StopWatch()
+    start = sw.time()
+    last_t = start
+
+    while True:
+        now = sw.time()
+        if now - start > timeout_ms:
+            break
+
+        dt = (now - last_t) / 1000.0
+        if dt <= 0:
+            dt = 0.01
+        last_t = now
+
+        heading = hub.imu.heading()
+        error = target - heading
+
+        if abs(error) <= tol:
+            break
+
+        integral += error * dt
+        integral = clamp(integral, -i_limit, i_limit)
+
+        derivative = (error - last_error) / dt
+        last_error = error
+
+        turn_rate = kp * error + ki * integral + kd * derivative
+        turn_rate = clamp(turn_rate, -turn_limit, turn_limit)
+
+        drive.drive(0, turn_rate)
+        wait(10)
+
+    stop_brake()
+    settle(140)
+
+# ============================================================
+# OPTIONAL: SIMPLE "BUMP ALIGN" (wall squaring)
+# ============================================================
+
+def bump_align(speed=120, ms=250):
+    """
+    Gently drives forward into a wall to square up.
+    Use only if you have a physical reference (field border).
+    """
+    drive.drive(speed, 0)
+    wait(ms)
+    stop_brake()
+    settle(150)
+
+# ============================================================
+# RUNS (ADD YOUR MISSIONS HERE)
+# ============================================================
+
+def run1():
+    beep(1)
+    # Example: go out, turn, go, come back
+    gyro_straight(650, base_speed=280, heading_deg=0)
+    gyro_turn(90)
+    gyro_straight(250, base_speed=220, heading_deg=90)
+    gyro_turn(-90)
+    gyro_straight(-700, base_speed=300, heading_deg=0)
+    beep(2)
+
+def run2():
+    beep(1)
+    # Example: align, go short precise, return
+    bump_align(speed=120, ms=220)
+    gyro_straight(420, base_speed=220, heading_deg=0)
+    gyro_turn(-45)
+    gyro_straight(180, base_speed=180, heading_deg=-45)
+    gyro_straight(-580, base_speed=280, heading_deg=-45)
+    beep(2)
+
+# ============================================================
+# MAIN: choose a run
+# ============================================================
+
+def main():
+    # Απλά άλλαξε εδώ ποιο run θες να τρέξει.
+    # (ή γράψε δικό σου selector με κουμπιά/χρώματα κλπ)
+    run1()
+    # run2()
+
+main()
